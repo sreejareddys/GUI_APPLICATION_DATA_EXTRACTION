@@ -1,0 +1,353 @@
+// ✅ Final GUI C Code with Min/Max in Dropdown, Auto CSV/PNG Open
+#include <windows.h>
+#include <commdlg.h>
+#include <shellapi.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <float.h>
+#include <math.h>
+
+#define VAR_COUNT 40
+#define FOOTER_COUNT 46
+#define MARKER_LEN 4
+#define STARTING_CAPACITY 1000
+#define ID_UPLOAD_BUTTON 101
+#define ID_COMBOBOX 102
+#define ID_PLOT_BUTTON 103
+
+const char *var_names[VAR_COUNT] = {
+    "A1", "A2", "A3", "A4", "A5", "A6", "A7", "A8", "A9", "A10",
+    "A11", "A12", "A13", "A14", "A15", "A16", "A17", "A18", "A19", "A20",
+    "A21", "A22", "A23", "A24", "A25", "A26", "A27", "A28", "A29", "A30",
+    "A31", "A32", "A33", "A34", "A35", "A36", "A37", "A38", "A39", "A40"
+};
+
+const char *footer_names[FOOTER_COUNT] = {
+    "B1", "B2", "B3", "B4", "B5", "B6", "B7", "B8", "B9", "B10",
+    "B11", "B12", "B13", "B14", "B15", "B16", "B17", "B18", "B19", "B20",
+    "B21", "B22", "B23", "B24", "B25", "B26", "B27", "B28", "B29", "B30",
+    "B31", "B32", "B33", "B34", "B35", "B36", "B37", "B38", "B39", "B40",
+    "B41", "B42", "B43", "B44", "B45", "B46"
+};
+
+const unsigned char marker[MARKER_LEN] = {0xB1, 0xB1, 0xB1, 0xB2};
+
+uint32_t **vars_history = NULL;
+uint32_t **footers_history = NULL;
+int *data_points = NULL;
+long *start_addresses = NULL;
+long *end_addresses = NULL;
+int total_rows = 0;
+
+float var_mins[VAR_COUNT], var_maxs[VAR_COUNT];
+float footer_mins[FOOTER_COUNT], footer_maxs[FOOTER_COUNT];
+
+HWND hComboBox, hStatus;
+
+float to_float(uint32_t val) {
+    union { uint32_t i; float f; } u;
+    u.i = ((val >> 24) & 0xff) | ((val >> 8) & 0xff00) | ((val << 8) & 0xff0000) | ((val << 24) & 0xff000000);
+    return u.f;
+}
+
+int compare_marker(const unsigned char *data) {
+    return memcmp(data, marker, MARKER_LEN) == 0;
+}
+
+void free_memory() {
+    for (int i = 0; i < total_rows; i++) {
+        free(vars_history[i]);
+        free(footers_history[i]);
+    }
+    free(vars_history);
+    free(footers_history);
+    free(data_points);
+    free(start_addresses);
+    free(end_addresses);
+}
+
+void write_output_csv(const char *filepath) {
+    FILE *fp = fopen("output.csv", "w");
+    if (!fp) return;
+
+    fprintf(fp, "Start Address,End Address,Bytes Count,Bits,Data Points,Row,");
+    for (int i = 0; i < VAR_COUNT; i++) fprintf(fp, "%s,", var_names[i]);
+    for (int i = 0; i < FOOTER_COUNT; i++) fprintf(fp, "%s,", footer_names[i]);
+    fprintf(fp, "Signal1_A,Signal1_B,Signal1_Mag,Signal2_A,Signal2_B,Signal2_Mag,Signal3_A,Signal3_B,Signal3_Mag\n");
+
+    FILE *file = fopen(filepath, "rb");
+    if (!file) {
+        fclose(fp);
+        return;
+    }
+
+    for (int r = 0; r < total_rows; r++) {
+        long byteCount = end_addresses[r] - start_addresses[r] + 1;
+        long bitCount = byteCount * 8;
+        fprintf(fp, "%ld,%ld,%ld,%ld,%d,%d,", start_addresses[r], end_addresses[r], byteCount, bitCount, data_points[r], r);
+
+        for (int i = 0; i < VAR_COUNT; i++) {
+            if (i == 5 || i == 11 || i == 12 || i == 13 || i == 14 || i == 16)
+                fprintf(fp, "%f,", to_float(vars_history[r][i]));
+            else
+                fprintf(fp, "%u,", vars_history[r][i]);
+        }
+
+        for (int i = 0; i < FOOTER_COUNT; i++) {
+            fprintf(fp, "%f,", to_float(footers_history[r][i]));
+        }
+
+        long segment_size = end_addresses[r] - start_addresses[r] + 1;
+        unsigned char *buffer = malloc(segment_size);
+        if (!buffer) {
+            fprintf(fp, ",,, ,,, ,,,\n");
+            continue;
+        }
+
+        fseek(file, start_addresses[r], SEEK_SET);
+        fread(buffer, 1, segment_size, file);
+
+        int offset_bits = (41 + (334 * 2) / 4 + (336 * 8) / 4) * 32 + 512;
+        int offset_bytes = offset_bits / 8;
+
+        if (offset_bytes + 12 <= segment_size) {
+            uint32_t sig1 = *(uint32_t *)(buffer + offset_bytes);
+            uint32_t sig2 = *(uint32_t *)(buffer + offset_bytes + 4);
+            uint32_t sig3 = *(uint32_t *)(buffer + offset_bytes + 8);
+
+            uint16_t s1a = sig1 >> 16, s1b = sig1 & 0xFFFF;
+            uint16_t s2a = sig2 >> 16, s2b = sig2 & 0xFFFF;
+            uint16_t s3a = sig3 >> 16, s3b = sig3 & 0xFFFF;
+
+            float mag1 = sqrtf(s1a * s1a + s1b * s1b);
+            float mag2 = sqrtf(s2a * s2a + s2b * s2b);
+            float mag3 = sqrtf(s3a * s3a + s3b * s3b);
+
+            fprintf(fp, "%u,%u,%.4f,%u,%u,%.4f,%u,%u,%.4f\n",
+                    s1a, s1b, mag1,
+                    s2a, s2b, mag2,
+                    s3a, s3b, mag3);
+        } else {
+            fprintf(fp, ",,, ,,, ,,,\n");
+        }
+
+        free(buffer);
+    }
+
+    fclose(file);
+    fclose(fp);
+    ShellExecute(NULL, "open", "output.csv", NULL, NULL, SW_SHOW);
+}
+
+void process_file(const char *filepath) {
+    FILE *file = fopen(filepath, "rb");
+    if (!file) return;
+
+    for (int i = 0; i < VAR_COUNT; i++) {
+        var_mins[i] = FLT_MAX;
+        var_maxs[i] = -FLT_MAX;
+    }
+    for (int i = 0; i < FOOTER_COUNT; i++) {
+        footer_mins[i] = FLT_MAX;
+        footer_maxs[i] = -FLT_MAX;
+    }
+
+    unsigned char buffer[4];
+    int offset_bits = (41 + (334 * 2) / 4 + (336 * 8) / 4) * 32 + 512;
+    int offset_bytes = offset_bits / 8;
+    int capacity = STARTING_CAPACITY;
+
+    vars_history = malloc(capacity * sizeof(uint32_t *));
+    footers_history = malloc(capacity * sizeof(uint32_t *));
+    data_points = malloc(capacity * sizeof(int));
+    start_addresses = malloc(capacity * sizeof(long));
+    end_addresses = malloc(capacity * sizeof(long));
+
+    long start_addr = -1, end_addr = -1;
+    long file_pos = 0;
+
+    while (fread(buffer, 1, 4, file) == 4) {
+        if (compare_marker(buffer)) {
+            if (start_addr == -1) {
+                start_addr = file_pos;
+            } else {
+                end_addr = file_pos + 3;
+                long byte_diff = end_addr - start_addr + 1;
+                long datapoints = (byte_diff * 8) / 32;
+
+                if (total_rows >= capacity) {
+                    capacity *= 2;
+                    vars_history = realloc(vars_history, capacity * sizeof(uint32_t *));
+                    footers_history = realloc(footers_history, capacity * sizeof(uint32_t *));
+                    data_points = realloc(data_points, capacity * sizeof(int));
+                    start_addresses = realloc(start_addresses, capacity * sizeof(long));
+                    end_addresses = realloc(end_addresses, capacity * sizeof(long));
+                }
+
+                vars_history[total_rows] = malloc(VAR_COUNT * sizeof(uint32_t));
+                footers_history[total_rows] = malloc(FOOTER_COUNT * sizeof(uint32_t));
+                data_points[total_rows] = (int)datapoints;
+                start_addresses[total_rows] = start_addr;
+                end_addresses[total_rows] = end_addr;
+
+                fseek(file, start_addr + MARKER_LEN, SEEK_SET);
+                fread(vars_history[total_rows], sizeof(uint32_t), VAR_COUNT, file);
+                fseek(file, start_addr + offset_bytes, SEEK_SET);
+                fread(footers_history[total_rows], sizeof(uint32_t), FOOTER_COUNT, file);
+
+                for (int v = 0; v < VAR_COUNT; v++) {
+                    float val = (v == 5 || v == 11 || v == 12 || v == 13 || v == 14 || v == 16)
+                                ? to_float(vars_history[total_rows][v])
+                                : (float)vars_history[total_rows][v];
+                    if (val < var_mins[v]) var_mins[v] = val;
+                    if (val > var_maxs[v]) var_maxs[v] = val;
+                }
+
+                for (int f = 0; f < FOOTER_COUNT; f++) {
+                    float val = to_float(footers_history[total_rows][f]);
+                    if (val < footer_mins[f]) footer_mins[f] = val;
+                    if (val > footer_maxs[f]) footer_maxs[f] = val;
+                }
+
+                total_rows++;
+                start_addr = -1;
+                fseek(file, end_addr + 1, SEEK_SET);
+                file_pos = end_addr + 1;
+                continue;
+            }
+        }
+        fseek(file, ++file_pos, SEEK_SET);
+    }
+
+    fclose(file);
+
+    SendMessage(hComboBox, CB_RESETCONTENT, 0, 0);
+    char name[128];
+
+    for (int i = 0; i < VAR_COUNT; i++) {
+        sprintf(name, "%s [%.2f : %.2f]", var_names[i], var_mins[i], var_maxs[i]);
+        SendMessage(hComboBox, CB_ADDSTRING, 0, (LPARAM)name);
+    }
+    for (int i = 0; i < FOOTER_COUNT; i++) {
+        sprintf(name, "%s [%.2f : %.2f]", footer_names[i], footer_mins[i], footer_maxs[i]);
+        SendMessage(hComboBox, CB_ADDSTRING, 0, (LPARAM)name);
+    }
+    SendMessage(hComboBox, CB_SETCURSEL, 0, 0);
+
+    char status[100];
+    sprintf(status, "Total Rows: %d", total_rows);
+    SetWindowText(hStatus, status);
+}
+
+void plot_variable(const char *varName) {
+    FILE *fp = fopen("plot_data.csv", "w");
+    if (!fp) {
+        MessageBox(NULL, "❌ Cannot create plot_data.csv", "Error", MB_ICONERROR);
+        return;
+    }
+
+    char baseName[4];
+    sscanf(varName, "%3s", baseName);
+    int isFooter = (baseName[0] == 'B');
+    int index = atoi(baseName + 1) - 1;
+
+    for (int i = 0; i < total_rows; i++) {
+        if (isFooter)
+            fprintf(fp, "%d,%f\n", i, to_float(footers_history[i][index]));
+        else if (index == 5 || index == 11 || index == 12 || index == 13 || index == 14 || index == 16)
+            fprintf(fp, "%d,%f\n", i, to_float(vars_history[i][index]));
+        else
+            fprintf(fp, "%d,%u\n", i, vars_history[i][index]);
+    }
+
+    fclose(fp);
+
+    int result = system("gnuplot -e \"set datafile separator ','; set terminal png size 800,600; set output 'plot.png'; plot 'plot_data.csv' using 1:2 with lines title 'Plot'\"");
+    if (result != 0) {
+        MessageBox(NULL, "❌ Gnuplot command failed", "Plot Error", MB_ICONERROR);
+        return;
+    }
+
+    ShellExecute(NULL, "open", "plot_data.csv", NULL, NULL, SW_SHOW);
+    ShellExecute(NULL, "open", "plot.png", NULL, NULL, SW_SHOW);
+}
+
+void open_file_dialog(HWND hwnd) {
+    char file_path[MAX_PATH] = "";
+    OPENFILENAME ofn = {0};
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner = hwnd;
+    ofn.lpstrFilter = "DAT Files\0*.dat\0All Files\0*.*\0";
+    ofn.lpstrFile = file_path;
+    ofn.nMaxFile = MAX_PATH;
+    ofn.Flags = OFN_FILEMUSTEXIST;
+
+    if (GetOpenFileName(&ofn)) {
+        total_rows = 0;
+        free_memory();
+        process_file(file_path);
+        write_output_csv(file_path);
+
+        MessageBox(hwnd, "✅ Extraction completed and dropdown populated!", "Done", MB_OK);
+    }
+}
+
+LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
+    switch (uMsg) {
+    case WM_CREATE:
+        CreateWindow("BUTTON", "Upload .dat File", WS_VISIBLE | WS_CHILD,
+                     20, 20, 150, 30, hwnd, (HMENU)ID_UPLOAD_BUTTON, NULL, NULL);
+
+        hComboBox = CreateWindow("COMBOBOX", NULL,
+                     CBS_DROPDOWNLIST | WS_VISIBLE | WS_CHILD | WS_VSCROLL,
+                     200, 20, 350, 300, hwnd, (HMENU)ID_COMBOBOX, NULL, NULL);
+
+        CreateWindow("BUTTON", "Plot Variable", WS_VISIBLE | WS_CHILD,
+                     20, 60, 150, 30, hwnd, (HMENU)ID_PLOT_BUTTON, NULL, NULL);
+
+        hStatus = CreateWindow("STATIC", "Total Rows: 0", WS_VISIBLE | WS_CHILD,
+                     200, 60, 400, 25, hwnd, NULL, NULL, NULL);
+        return 0;
+
+    case WM_COMMAND:
+        if (LOWORD(wParam) == ID_UPLOAD_BUTTON) {
+            open_file_dialog(hwnd);
+        } else if (LOWORD(wParam) == ID_PLOT_BUTTON) {
+            char varName[128];
+            int sel = SendMessage(hComboBox, CB_GETCURSEL, 0, 0);
+            SendMessage(hComboBox, CB_GETLBTEXT, sel, (LPARAM)varName);
+            plot_variable(varName);
+        }
+        return 0;
+
+    case WM_DESTROY:
+        PostQuitMessage(0);
+        return 0;
+    }
+    return DefWindowProc(hwnd, uMsg, wParam, lParam);
+}
+
+int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmdLine, int nCmdShow) {
+    const char CLASS_NAME[] = "MainWindowClass";
+    WNDCLASS wc = {0};
+    wc.lpfnWndProc = WindowProc;
+    wc.hInstance = hInst;
+    wc.lpszClassName = CLASS_NAME;
+    RegisterClass(&wc);
+
+    HWND hwnd = CreateWindow(CLASS_NAME, "Binary File Extractor",
+                             WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT,
+                             600, 200, NULL, NULL, hInst, NULL);
+
+    ShowWindow(hwnd, nCmdShow);
+    UpdateWindow(hwnd);
+
+    MSG msg = {0};
+    while (GetMessage(&msg, NULL, 0, 0)) {
+        TranslateMessage(&msg);
+        DispatchMessage(&msg);
+    }
+    return 0;
+}
